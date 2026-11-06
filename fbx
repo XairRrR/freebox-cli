@@ -1,0 +1,1341 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 Philippe Pignatel
+"""fbx — surveillance d'une Freebox en ligne de commande (freebox-cli)
+
+Outil non officiel, sans lien avec Free / Iliad. Licence GPL-2.0-only.
+Utilise l'API locale Freebox OS, l'UPnP IGD et les notifications push de la box.
+
+Doc API : http://mafreebox.freebox.fr/doc/index.html (+ endpoints non documentés
+utilisés par l'interface Freebox OS : connection/logs/, connection/full/, update/).
+
+Diagnostic
+  fbx auth                 Enregistre l'appli (valider sur l'écran de la Freebox)
+  fbx status               État complet : système, étape 6, WAN, fibre, verdict
+  fbx logs [--save]        Journal de connexion interne de la box (effacé au reboot)
+  fbx upnp                 État WAN via UPnP (sans authentification)
+  fbx history [-H 24]      Coupures détectées dans l'historique RRD
+  fbx report [-H 48]       Rapport Markdown des coupures (pour réclamation Free)
+
+Matériel / réseau
+  fbx temp [-H 24]         Températures CPU et ventilateur (actuel + historique)
+  fbx traffic [-H 24]      Débits WAN et par port du switch (historique)
+  fbx ports                Ports Ethernet / SFP : lien, vitesse, erreurs, appareils
+  fbx wifi                 Points d'accès Wi-Fi et clients (signal, débit)
+  fbx lan                  Appareils connus sur le LAN
+
+Surveillance continue
+  fbx watch [--headless]   Tableau de bord live + journal local des changements
+  fbx events               Flux temps réel (WebSocket) : appareils LAN, VM, stockage
+  fbx notify serve|register|unregister|list   Notifications push émises par la box
+  fbx service install      Installe les services systemd utilisateur
+  fbx log [-n 50]          Journal local (watch / events / notify)
+  fbx get <chemin>         Appel brut GET (ex: fbx get connection/ftth/)
+"""
+import argparse
+import hashlib
+import hmac
+import http.server
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+__version__ = "2.0.0"
+APP_ID = "fr.freebox-cli.fbx"
+LEGACY_APP_IDS = ("fr.nta.fbxcli",)  # jetons créés avant 2.0.0
+APP_NAME = "fbx CLI"
+APP_VERSION = __version__
+BASE = os.environ.get("FBX_URL", "http://mafreebox.freebox.fr")
+UPNP_PORT = int(os.environ.get("FBX_UPNP_PORT", "5678"))
+NOTIF_PORT = int(os.environ.get("FBX_NOTIF_PORT", "47800"))
+CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "fbx"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "fbx"
+TOKEN_FILE = CONF_DIR / "token.json"
+EVENT_LOG = STATE_DIR / "events.jsonl"
+
+con = Console()
+_log_lock = threading.Lock()
+
+
+class FbxError(Exception):
+    def __init__(self, msg, code=None, missing_right=None):
+        super().__init__(msg)
+        self.code = code
+        self.missing_right = missing_right
+
+
+# ───────────────────────────── client API ─────────────────────────────
+
+class Freebox:
+    def __init__(self, base=BASE):
+        self.base = base.rstrip("/")
+        self.s = requests.Session()
+        self.s.headers["User-Agent"] = f"freebox-cli/{APP_VERSION}"
+        self.info = self.s.get(f"{self.base}/api_version", timeout=5).json()
+        major = self.info["api_version"].split(".")[0]
+        self.api = f"{self.base}{self.info.get('api_base_url', '/api/')}v{major}/"
+        self.session_token = None
+        self.permissions = {}
+
+    def _call(self, method, path, auth=True, **kw):
+        url = self.api + path.lstrip("/")
+        for attempt in range(2):
+            headers = {}
+            if auth and self.session_token:
+                headers["X-Fbx-App-Auth"] = self.session_token
+            r = self.s.request(method, url, headers=headers, timeout=10, **kw)
+            try:
+                j = r.json()
+            except ValueError:
+                raise FbxError(f"Réponse non JSON ({r.status_code}) sur {path}")
+            if j.get("success"):
+                return j.get("result")
+            code = j.get("error_code") or j.get("msg")
+            if auth and code == "auth_required" and attempt == 0:
+                self.login()
+                continue
+            raise FbxError(f"{path}: {j.get('msg', '?')} [{code}]", code, j.get("missing_right"))
+
+    def get(self, path, **kw):
+        return self._call("GET", path, **kw)
+
+    def post(self, path, data=None, **kw):
+        return self._call("POST", path, json=data, **kw)
+
+    def delete(self, path, **kw):
+        return self._call("DELETE", path, **kw)
+
+    def authorize(self):
+        res = self.post("login/authorize/", {
+            "app_id": APP_ID, "app_name": APP_NAME, "app_version": APP_VERSION,
+            "device_name": socket.gethostname(),
+        }, auth=False)
+        token, track = res["app_token"], res["track_id"]
+        con.print("[bold yellow]➜ Valide la demande sur l'écran de la Freebox Server…[/]")
+        with con.status("En attente de validation"):
+            while True:
+                st = self.get(f"login/authorize/{track}", auth=False)["status"]
+                if st != "pending":
+                    break
+                time.sleep(1)
+        if st != "granted":
+            raise FbxError(f"Autorisation refusée : {st}")
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        TOKEN_FILE.touch(mode=0o600, exist_ok=True)
+        os.chmod(TOKEN_FILE, 0o600)
+        TOKEN_FILE.write_text(json.dumps({"app_id": APP_ID, "app_token": token, "uid": self.info.get("uid")}))
+        con.print(f"[green]✓ Autorisé. Jeton stocké dans {TOKEN_FILE}[/]")
+
+    def login(self):
+        if not TOKEN_FILE.exists():
+            raise FbxError("Pas de jeton d'application : lance d'abord `fbx auth`", "no_token")
+        tok = json.loads(TOKEN_FILE.read_text())
+        app_token, app_id = tok["app_token"], tok.get("app_id", LEGACY_APP_IDS[0])
+        challenge = self.get("login/", auth=False)["challenge"]
+        pwd = hmac.new(app_token.encode(), challenge.encode(), hashlib.sha1).hexdigest()
+        res = self.post("login/session/", {"app_id": app_id, "password": pwd}, auth=False)
+        self.session_token = res["session_token"]
+        self.permissions = res.get("permissions", {})
+
+    def rrd(self, db, start, end, precision=None):
+        # GET + query string : autorisé sans la permission 'settings' (POST la requiert)
+        q = {"db": db, "date_start": int(start), "date_end": int(end)}
+        if precision:
+            q["precision"] = precision
+        return self._call("GET", "rrd/", params=q)
+
+    @property
+    def host(self):
+        return urlparse(self.base).hostname
+
+
+# ───────────────────────────── UPnP IGD (sans auth) ─────────────────────────────
+
+UPNP_SVC = {
+    "ip": ("/control/wan_ip_connection", "urn:schemas-upnp-org:service:WANIPConnection:1"),
+    "common": ("/control/wan_common_ifc", "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1"),
+}
+
+
+def upnp_call(host, svc, action, timeout=4):
+    ctrl, urn = UPNP_SVC[svc]
+    body = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+            f'<u:{action} xmlns:u="{urn}"/></s:Body></s:Envelope>')
+    r = requests.post(f"http://{host}:{UPNP_PORT}{ctrl}", data=body, timeout=timeout, headers={
+        "Content-Type": 'text/xml; charset="utf-8"', "SOAPAction": f'"{urn}#{action}"'})
+    return dict(re.findall(r"<New([A-Za-z]+)>([^<]*)<", r.text))
+
+
+def upnp_status(host):
+    out = {}
+    for svc, act in (("ip", "GetStatusInfo"), ("ip", "GetExternalIPAddress"), ("common", "GetCommonLinkProperties")):
+        try:
+            out.update(upnp_call(host, svc, act))
+        except requests.RequestException as e:
+            out["error"] = str(e)
+            break
+    return out
+
+
+_upnp_host = None
+
+
+def box_host():
+    """IP LAN de la box pour l'UPnP : découverte SSDP, sinon passerelle par défaut.
+    (mafreebox.freebox.fr résout vers une IP publique Free, pas vers la box.)"""
+    global _upnp_host, UPNP_PORT
+    if _upnp_host:
+        return _upnp_host
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(1.5)
+    try:
+        s.sendto(b'M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 1\r\n'
+                 b'ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n', ("239.255.255.250", 1900))
+        while True:
+            data, _ = s.recvfrom(4096)
+            m = re.search(rb"(?im)^LOCATION:\s*http://([0-9.]+):(\d+)/", data)
+            if m and b"fbx" in data.lower():
+                _upnp_host, UPNP_PORT = m.group(1).decode(), int(m.group(2))
+                return _upnp_host
+    except OSError:
+        pass
+    finally:
+        s.close()
+    try:  # passerelle par défaut
+        for ln in Path("/proc/net/route").read_text().splitlines()[1:]:
+            f = ln.split()
+            if f[1] == "00000000" and f[2] != "00000000":
+                _upnp_host = socket.inet_ntoa(int(f[2], 16).to_bytes(4, "little"))
+                return _upnp_host
+    except OSError:
+        pass
+    return urlparse(BASE).hostname
+
+
+# ───────────────────────────── helpers ─────────────────────────────
+
+def ok(b, yes="oui", no="NON"):
+    if b is None:
+        return Text("?", style="dim")
+    return Text(yes, style="green") if b else Text(no, style="bold red")
+
+
+def fmt_bits(bps):
+    if bps is None:
+        return "—"
+    for unit in ("bit/s", "kbit/s", "Mbit/s", "Gbit/s"):
+        if abs(bps) < 1000:
+            return f"{bps:.1f} {unit}"
+        bps /= 1000
+    return f"{bps:.1f} Tbit/s"
+
+
+def fmt_bytes(n):
+    if n is None:
+        return "—"
+    for unit in ("o", "Ko", "Mo", "Go", "To"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} Po"
+
+
+def fmt_dur(sec):
+    sec = int(sec)
+    d, sec = divmod(sec, 86400)
+    h, sec = divmod(sec, 3600)
+    m, s = divmod(sec, 60)
+    out = (f"{d}j " if d else "") + (f"{h}h" if h or d else "") + f"{m:02d}m"
+    return out if (d or h) else f"{m}m{s:02d}s"
+
+
+def fmt_ts(ts, fmt="%d/%m %H:%M:%S"):
+    return datetime.fromtimestamp(ts).strftime(fmt) if ts else "—"
+
+
+def dbm(v):
+    return None if v is None else v / 100.0
+
+
+def safe(fn, *a, **kw):
+    try:
+        return fn(*a, **kw), None
+    except Exception as e:  # noqa: BLE001
+        return None, str(e)
+
+
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(points, width=40, lo=None, hi=None):
+    """points = [(timestamp, valeur|None)] ; découpage par tranches de temps égales
+    (le RRD mélange plusieurs résolutions). Tranche sans mesure = espace."""
+    pts = [(t, v) for t, v in points if v is not None]
+    if not pts:
+        return ""
+    vals = [v for _, v in pts]
+    t0, t1 = points[0][0], points[-1][0]
+    span = (t1 - t0) or 1
+    acc = [[] for _ in range(width)]
+    for t, v in pts:
+        acc[min(width - 1, int((t - t0) / span * width))].append(v)
+    buckets = [max(c) if c else None for c in acc]
+    lo = min(vals) if lo is None else lo
+    hi = max(vals) if hi is None else hi
+    span = (hi - lo) or 1
+    return "".join(" " if b is None else SPARK[min(7, int((b - lo) / span * 7.999))] for b in buckets)
+
+
+def internet_check():
+    """Test côté PC : DNS + TCP vers des hôtes publics."""
+    res = {}
+    for name, (host, port) in {"1.1.1.1:443": ("1.1.1.1", 443), "8.8.8.8:53": ("8.8.8.8", 53)}.items():
+        t = time.monotonic()
+        try:
+            socket.create_connection((host, port), timeout=3).close()
+            res[name] = round((time.monotonic() - t) * 1000)
+        except OSError:
+            res[name] = None
+    try:
+        socket.getaddrinfo("free.fr", 443)
+        res["dns"] = True
+    except OSError:
+        res["dns"] = False
+    return res
+
+
+def desktop_notify(title, body, urgent=False):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "fbx", "-u", "critical" if urgent else "normal", title, body],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ───────────────────────────── journal local ─────────────────────────────
+
+def log_event(kind, detail):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": datetime.now().isoformat(timespec="seconds"), "event": kind, "detail": detail}
+    with _log_lock, EVENT_LOG.open("a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return rec
+
+
+def read_events():
+    if not EVENT_LOG.exists():
+        return []
+    out = []
+    for ln in EVENT_LOG.read_text().splitlines():
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            pass
+    return out
+
+
+def describe_event(r):
+    d, ev = r["detail"], r["event"]
+    if ev == "change" and d.get("champ") == "etape":
+        return Text(f"étape {d['avant']} → {d['apres']}", style="green" if d["apres"] == "8" else "bold red")
+    if ev == "change":
+        bad = d["apres"] in (False, "down", "going_down", None)
+        return Text(f"{d['champ']}: {d['avant']} → {d['apres']}", style="red" if bad else "green")
+    if ev == "box_log":
+        return Text(describe_box_log(d), style="green" if d.get("state") == "up" else "red")
+    if ev == "box_push":
+        p = d.get("payload") or {}
+        return Text(f"{p.get('type', '?')}: {p.get('event', '?')}  {json.dumps(p.get('data') or '', ensure_ascii=False)[:60]}",
+                    style="bold magenta")
+    if ev == "ws":
+        res = d.get("result") or {}
+        name = res.get("primary_name") or res.get("name") or res.get("id", "")
+        return Text(f"{d.get('source')}_{d.get('event')}  {name}",
+                    style="yellow" if "unreachable" in d.get("event", "") else "cyan")
+    if ev == "initial":
+        return Text("état initial : " + ", ".join(f"{k}={v}" for k, v in d.items()), style="dim")
+    if ev == "reboot":
+        return Text("La box a redémarré", style="bold red")
+    return Text(json.dumps(d, ensure_ascii=False)[:120], style="dim")
+
+
+# ───────────────────────────── journal de connexion de la box ─────────────────────────────
+
+CONN_NAMES = {"ftth_pub": "Fibre (IP publique)", "ftth_priv": "Fibre (privée/services)", "backup_4g": "Backup 4G",
+              "xdsl_pub": "xDSL", "vdsl_pub": "VDSL", "lanwan_pub": "WAN Ethernet"}
+
+
+def describe_box_log(e):
+    if e.get("type") == "link":
+        bw = f"  ↓{fmt_bits(e.get('bw_down'))} ↑{fmt_bits(e.get('bw_up'))}" if e.get("state") == "up" else ""
+        return f"Lien {e.get('link', '?')} {e.get('state', '?')}{bw}"
+    name = CONN_NAMES.get(e.get("conn"), e.get("conn", "?"))
+    return f"Connexion {name} {e.get('state', '?')}"
+
+
+def box_log_key(e):
+    return f"{e.get('date')}|{e.get('type')}|{e.get('conn') or e.get('link')}|{e.get('state')}"
+
+
+def sync_box_logs(fbx):
+    """Archive dans le journal local les entrées de connection/logs/ pas encore vues
+    (la box efface ce journal à chaque redémarrage). Retourne les nouvelles entrées."""
+    entries = fbx.get("connection/logs/") or []
+    seen = {box_log_key(r["detail"]) for r in read_events() if r["event"] == "box_log"}
+    new = []
+    for e in sorted(entries, key=lambda e: e.get("date", 0)):
+        if box_log_key(e) not in seen:
+            rec = {"ts": datetime.fromtimestamp(e["date"]).isoformat(timespec="seconds"), "event": "box_log", "detail": e}
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with _log_lock, EVENT_LOG.open("a") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            new.append(e)
+    return new
+
+
+# ───────────────────────────── collecte & verdict ─────────────────────────────
+
+def snapshot(fbx):
+    snap = {"ts": time.time()}
+    snap["system"], snap["system_err"] = safe(fbx.get, "system/")
+    full, err = safe(fbx.get, "connection/full/")
+    if full is None:  # repli sur les endpoints documentés
+        full, err = safe(fbx.get, "connection/")
+        if full is not None:
+            full["ftth"], _ = safe(fbx.get, "connection/ftth/")
+    snap["conn"], snap["conn_err"] = full, err
+    snap["ftth"] = (full or {}).get("ftth")
+    snap["update"], _ = safe(fbx.get, "update/")
+    snap["logs"], _ = safe(fbx.get, "connection/logs/")
+    return snap
+
+
+RX_MIN, RX_WARN, RX_MAX = -28.0, -25.0, -8.0  # plages PON usuelles (dBm)
+
+
+def boot_phase(snap):
+    """Étape de démarrage Freebox déduite des indicateurs de l'API (cf. assistance.free.fr/articles/311).
+    Retourne (code, libellé, responsable)."""
+    sysc, conn, ftth = snap.get("system") or {}, snap.get("conn") or {}, snap.get("ftth") or {}
+    if not sysc and not conn:
+        return "?", "Box injoignable", "?"
+    if ftth:
+        if not ftth.get("sfp_present") or not ftth.get("sfp_alim_ok"):
+            return "1", "Module fibre absent ou non alimenté", "matériel (box)"
+        if not ftth.get("sfp_has_signal"):
+            return "2", "Recherche du signal : aucune lumière reçue", "fibre / PM / NRO"
+        if not ftth.get("link"):
+            return "3", "Signal reçu, enregistrement PON auprès de l'OLT impossible", "équipement fibre Free (OLT)"
+    if sysc.get("box_authenticated") is False:
+        return "6", "Lien OK mais authentification de la Freebox refusée ou sans réponse", "serveurs d'authentification Free"
+    if conn.get("state") != "up":
+        return "7", f"Authentifiée, connexion WAN {conn.get('state', '?')}", "configuration WAN Free"
+    return "8", "Opérationnelle", "—"
+
+
+def verdict(snap):
+    sysc, conn, ftth = snap.get("system") or {}, snap.get("conn") or {}, snap.get("ftth") or {}
+    if not snap.get("system") and not snap.get("conn"):
+        up = snap.get("upnp") or {}
+        if up.get("ConnectionStatus"):
+            return "yellow", (f"API injoignable ({snap.get('system_err')}) — UPnP : WAN {up.get('ConnectionStatus')}, "
+                              f"lien {up.get('PhysicalLinkStatus')}")
+        return "red", f"Freebox injoignable : {snap.get('system_err')}"
+    issues = []
+    rx = dbm(ftth.get("sfp_pwr_rx"))
+    if ftth:
+        if not ftth.get("sfp_present"):
+            issues.append(("local", "Module SFP fibre absent / non détecté"))
+        elif not ftth.get("sfp_alim_ok"):
+            issues.append(("local", "Module SFP non alimenté"))
+        elif not ftth.get("sfp_has_signal"):
+            issues.append(("ligne", "Aucun signal optique reçu : fibre coupée/débranchée ou panne en amont (PM/NRO)"))
+        elif rx is not None and rx < RX_MIN:
+            issues.append(("ligne", f"Signal optique trop faible ({rx:.2f} dBm) : fibre dégradée/sale"))
+        elif not ftth.get("link"):
+            issues.append(("ligne", "Signal optique présent mais pas de lien PON (OLT côté Free)"))
+    if sysc and sysc.get("box_authenticated") is False:
+        issues.append(("free", "Étape 6 : la box n'est pas authentifiée par le réseau Free "
+                               "(lien optique OK mais refus/absence de réponse des serveurs Free)"))
+    st = conn.get("state")
+    if st and st != "up":
+        issues.append(("free" if ftth.get("link") else "ligne", f"Connexion WAN : {st}"))
+    if not issues:
+        return "green", "Tout est OK : fibre, authentification (étape 6) et WAN opérationnels."
+    code, label, who = boot_phase(snap)
+    issues.insert(0, ("free" if code in ("3", "6", "7") else ("ligne" if code == "2" else "local"),
+                      f"[bold]Bloquée à l'étape {code}[/] : {label} (responsable probable : {who})"))
+    where = {"local": "chez toi (matériel)", "ligne": "sur la ligne fibre / réseau d'accès",
+             "free": "côté Free (cœur de réseau / authentification)"}
+    return "red", "\n".join(f"• {msg}  →  [bold]{where[w]}[/]" for w, msg in issues)
+
+
+def kv_table():
+    t = Table(show_header=False, box=None, pad_edge=False)
+    t.add_column(style="cyan", no_wrap=True)
+    t.add_column()
+    return t
+
+
+def render_status(snap, net=None, recent=None):
+    sysc, conn, ftth = snap.get("system") or {}, snap.get("conn") or {}, snap.get("ftth") or {}
+    grid = Table.grid(expand=True, padding=(0, 1))
+    grid.add_column(ratio=1)
+    grid.add_column(ratio=1)
+
+    t = kv_table()
+    mi = sysc.get("model_info") or {}
+    t.add_row("Modèle", mi.get("pretty_name") or sysc.get("board_name", "?"))
+    upd = (snap.get("update") or {}).get("state")
+    t.add_row("Firmware", f"{sysc.get('firmware_version', '?')}" + (f"  ({upd})" if upd else ""))
+    t.add_row("Uptime", sysc.get("uptime", "?"))
+    if sysc.get("uptime_val") is not None:
+        t.add_row("Démarrée le", fmt_ts(time.time() - sysc["uptime_val"], "%d/%m/%Y %H:%M:%S"))
+    t.add_row("Étape 6 (auth)", ok(sysc.get("box_authenticated"), "authentifiée", "NON AUTHENTIFIÉE"))
+    code, label, who = boot_phase(snap)
+    t.add_row("Étape actuelle", Text(f"{code} — {label}", style="green" if code == "8" else "bold red"))
+    t.add_row("Disque", sysc.get("disk_status", "?"))
+    for s_ in sysc.get("sensors") or []:
+        v = s_.get("value")
+        t.add_row(f"  {s_.get('name')}", Text(f"{v} °C", style="red" if v and v >= 85 else ("yellow" if v and v >= 75 else "")))
+    for f in sysc.get("fans") or []:
+        t.add_row(f"  {f.get('name')}", f"{f.get('value')} tr/min")
+    left = Panel(t if sysc else Text(snap.get("system_err") or "?", style="red"), title="Système")
+
+    w = kv_table()
+    st = conn.get("state")
+    w.add_row("État WAN", Text(st or "?", style="green" if st == "up" else "bold red"))
+    logs = snap.get("logs") or []
+    last_up = max((e["date"] for e in logs if e.get("type") == "conn" and e.get("state") == "up"), default=None)
+    if last_up and st == "up":
+        w.add_row("Connecté depuis", f"{fmt_ts(last_up)} ({fmt_dur(time.time() - last_up)})")
+    w.add_row("Média / type", f"{conn.get('media', '?')} / {conn.get('type', '?')}")
+    w.add_row("IPv4", conn.get("ipv4", "—"))
+    w.add_row("IPv6", conn.get("ipv6", "—"))
+    if conn.get("ipv4_port_range") and conn["ipv4_port_range"] != [0, 65535]:
+        w.add_row("Plage ports", f"{conn['ipv4_port_range']} (IP partagée)")
+    w.add_row("Débit dispo ↓/↑", f"{fmt_bits(conn.get('bandwidth_down'))} / {fmt_bits(conn.get('bandwidth_up'))}")
+    w.add_row("Trafic ↓/↑", f"{fmt_bits((conn.get('rate_down') or 0) * 8)} / {fmt_bits((conn.get('rate_up') or 0) * 8)}")
+    w.add_row("Volume session", f"↓ {fmt_bytes(conn.get('bytes_down'))}  ↑ {fmt_bytes(conn.get('bytes_up'))}")
+    if ftth:
+        rx, tx = dbm(ftth.get("sfp_pwr_rx")), dbm(ftth.get("sfp_pwr_tx"))
+        rx_style = ("green" if rx is not None and RX_WARN <= rx <= RX_MAX
+                    else ("yellow" if rx is not None and rx >= RX_MIN else "red"))
+        w.add_row("SFP fibre", f"{ftth.get('sfp_vendor', '?')} {ftth.get('sfp_model', '')} ({ftth.get('link_type', '?')})")
+        w.add_row("Signal / lien PON", Text.assemble(ok(ftth.get("sfp_has_signal")), " / ", ok(ftth.get("link"))))
+        w.add_row("Puissance Rx / Tx", Text.assemble(Text("—" if rx is None else f"{rx:.2f} dBm", style=rx_style),
+                                                    " / ", "—" if tx is None else f"{tx:.2f} dBm"))
+    right = Panel(w if conn else Text(snap.get("conn_err") or "?", style="red"), title="Connexion / Fibre")
+    grid.add_row(left, right)
+
+    parts = [grid]
+    if net:
+        n = "  ".join(f"{k}: " + (f"[green]{v} ms[/]" if isinstance(v, int) and not isinstance(v, bool)
+                                  else ("[green]ok[/]" if v is True else "[red]KO[/]")) for k, v in net.items())
+        parts.append(Panel(n, title="Test Internet depuis ce PC"))
+    if logs:
+        lt = Text()
+        for e in sorted(logs, key=lambda e: e.get("date", 0))[-6:]:
+            lt.append(f"{fmt_ts(e.get('date'))}  ", style="dim")
+            lt.append(describe_box_log(e) + "\n", style="green" if e.get("state") == "up" else "red")
+        lt.rstrip()
+        parts.append(Panel(lt, title="Journal de connexion de la box (depuis son démarrage)"))
+    if recent:
+        rt = Text()
+        for r in recent:
+            rt.append(r["ts"].replace("T", " ")[5:] + "  ", style="dim")
+            rt.append_text(describe_event(r))
+            rt.append("\n")
+        rt.rstrip()
+        parts.append(Panel(rt, title="Derniers évènements enregistrés"))
+    color, msg = verdict(snap)
+    parts.append(Panel(msg, title="Diagnostic", border_style=color))
+    parts.append(Text(f"Mis à jour {datetime.now():%H:%M:%S}", style="dim"))
+    return Group(*parts)
+
+
+# ───────────────────────────── commandes : diagnostic ─────────────────────────────
+
+def cmd_auth(fbx, a):
+    fbx.authorize()
+    fbx.login()
+    perms = ", ".join(k for k, v in fbx.permissions.items() if v) or "aucune"
+    con.print(f"Session ouverte. Permissions : {perms}")
+    if not fbx.permissions.get("settings"):
+        con.print("[yellow]Pour `fbx notify register`, accorde « Modification des réglages » à « fbx CLI » dans "
+                  "Freebox OS → Paramètres → Gestion des accès → Applications.[/]")
+
+
+def cmd_status(fbx, a):
+    fbx.login()
+    snap = snapshot(fbx)
+    snap["upnp"] = upnp_status(box_host())
+    con.print(render_status(snap, internet_check()))
+
+
+def cmd_get(fbx, a):
+    fbx.login()
+    con.print_json(json.dumps(fbx.get(a.path)))
+
+
+def cmd_logs(fbx, a):
+    fbx.login()
+    entries = sorted(fbx.get("connection/logs/") or [], key=lambda e: e.get("date", 0))
+    sysc, _ = safe(fbx.get, "system/")
+    if sysc and sysc.get("uptime_val") is not None:
+        con.print(f"[dim]Journal interne de la box, effacé au redémarrage (dernier : "
+                  f"{fmt_ts(time.time() - sysc['uptime_val'], '%d/%m/%Y %H:%M:%S')}).[/]")
+    t = Table(title="Journal de connexion de la Freebox")
+    for c in ("Date", "Type", "Élément", "État", "Débit ↓/↑"):
+        t.add_column(c)
+    prev_down = {}
+    for e in entries:
+        key = (e.get("type"), e.get("conn") or e.get("link"))
+        st = e.get("state")
+        extra = ""
+        if st == "down":
+            prev_down[key] = e["date"]
+        elif st == "up" and key in prev_down:
+            extra = f"  (coupé {fmt_dur(e['date'] - prev_down.pop(key))})"
+        t.add_row(fmt_ts(e.get("date"), "%d/%m/%Y %H:%M:%S"), "lien" if e.get("type") == "link" else "connexion",
+                  CONN_NAMES.get(e.get("conn"), e.get("conn") or e.get("link") or "?"),
+                  Text(f"{st}{extra}", style="green" if st == "up" else "bold red"),
+                  f"{fmt_bits(e.get('bw_down'))} / {fmt_bits(e.get('bw_up'))}" if e.get("bw_down") else "")
+    con.print(t)
+    archived = [r["detail"] for r in read_events() if r["event"] == "box_log"]
+    older = [e for e in archived if e.get("date", 0) < (entries[0]["date"] if entries else time.time())]
+    if older:
+        con.print(f"[dim]{len(older)} entrée(s) plus ancienne(s) archivée(s) localement : `fbx log --box`.[/]")
+    if a.save:
+        n = len(sync_box_logs(fbx))
+        con.print(f"[green]{n} nouvelle(s) entrée(s) archivée(s) dans {EVENT_LOG}[/]")
+
+
+def cmd_upnp(fbx, a):
+    host = box_host()
+    st = upnp_status(host)
+    if "error" in st and len(st) == 1:
+        con.print(f"[red]UPnP injoignable sur {host}:{UPNP_PORT} : {st['error']}[/]")
+        return 1
+    t = kv_table()
+    cs = st.get("ConnectionStatus")
+    t.add_row("Connexion WAN", Text(cs or "?", style="green" if cs == "Connected" else "bold red"))
+    t.add_row("Lien physique", Text(st.get("PhysicalLinkStatus", "?"),
+                                    style="green" if st.get("PhysicalLinkStatus") == "Up" else "bold red"))
+    if st.get("Uptime"):
+        up = int(st["Uptime"])
+        t.add_row("Connectée depuis", f"{fmt_dur(up)} (depuis {fmt_ts(time.time() - up, '%d/%m %H:%M:%S')})")
+    t.add_row("IP publique", st.get("ExternalIPAddress", "—"))
+    t.add_row("Dernière erreur", st.get("LastConnectionError", "—"))
+    con.print(Panel(t, title=f"UPnP IGD — {host}:{UPNP_PORT} (sans authentification)"))
+
+
+def sample_up(d):
+    """Point RRD 'up' s'il contient un débit disponible non nul (pendant une
+    coupure la box écrit des points vides, sans champ bw_down)."""
+    return bool(d.get("bw_down"))
+
+
+def find_outages(data):
+    """[(debut, fin|None, raisons)] à partir des points RRD triés. Le RRD mélange
+    plusieurs résolutions : un « trou » = intervalle > 30 min, ou > 6× les voisins."""
+    times = [d["time"] for d in data]
+    iv = [b - a for a, b in zip(times, times[1:])]
+    events, cur = [], None
+    for i, d in enumerate(data):
+        t_ = d["time"]
+        if i > 0:
+            gap = iv[i - 1]
+            prev_iv = iv[i - 2] if i >= 2 else gap
+            next_iv = iv[i] if i < len(iv) else gap
+            if gap > 1800 or (gap > 300 and gap > 6 * prev_iv and gap > 6 * next_iv):
+                if cur is None:
+                    cur = [times[i - 1], None, set()]
+                cur[2].add("aucune mesure enregistrée")
+        if not sample_up(d):
+            if cur is None:
+                cur = [t_, None, set()]
+            cur[2].add("WAN coupé (points vides)" if "bw_down" not in d else "débit disponible = 0")
+        elif cur is not None:
+            cur[1] = t_
+            events.append(tuple(cur))
+            cur = None
+    if cur is not None:
+        events.append(tuple(cur))
+    return events
+
+
+def fetch_net(fbx, hours):
+    end = int(time.time())
+    res = fbx.rrd("net", end - int(hours * 3600), end)
+    return end, sorted(res.get("data") or [], key=lambda d: d["time"])
+
+
+def cmd_history(fbx, a):
+    fbx.login()
+    end, data = fetch_net(fbx, a.hours)
+    if not data:
+        con.print("[red]Aucune donnée RRD renvoyée.[/]")
+        return
+    times = [d["time"] for d in data]
+    sysc, _ = safe(fbx.get, "system/")
+    boot = end - sysc["uptime_val"] if sysc and sysc.get("uptime_val") is not None else None
+    con.print(f"[dim]RRD net : {len(data)} points du {fmt_ts(times[0], '%d/%m %H:%M')} au "
+              f"{fmt_ts(times[-1], '%d/%m %H:%M')} (résolution variable : 10 s → 2 min → 14 min…)[/]")
+
+    events = find_outages(data)
+    width = max(20, min(con.width - 6, 120))
+    t0, span = times[0], (times[-1] - times[0]) or 1
+    cells = ["up"] * width
+    for s_, e, why in events:
+        i0 = int((s_ - t0) / span * (width - 1))
+        i1 = int(((e or times[-1]) - t0) / span * (width - 1))
+        for i in range(i0, i1 + 1):
+            cells[i] = "nodata" if why == {"aucune mesure enregistrée"} else "down"
+    bar = Text()
+    for c in cells:
+        bar.append("█" if c != "nodata" else "▒", style={"up": "green", "down": "red", "nodata": "yellow"}[c])
+    con.print(Panel(bar, title="Disponibilité WAN  [green]█ OK[/]  [red]█ coupé[/]  [yellow]▒ pas de mesure[/]",
+                    subtitle=f"{fmt_ts(t0, '%d/%m %H:%M')}  →  {fmt_ts(times[-1], '%d/%m %H:%M')}"))
+    if not events:
+        con.print("[green]Aucune coupure détectée sur la période.[/]")
+    else:
+        t = Table(title="Coupures détectées")
+        for c in ("Début", "Fin", "Durée", "Constat"):
+            t.add_column(c)
+        total = 0
+        for s_, e, why in events:
+            dur = (e or end) - s_
+            total += dur
+            note = " + ".join(sorted(why))
+            if boot and s_ <= boot <= (e or end):
+                note += f" ; box redémarrée à {fmt_ts(boot, '%H:%M')}"
+            t.add_row(fmt_ts(s_), fmt_ts(e) if e else "[red]en cours[/]",
+                      Text(fmt_dur(dur), style="bold red" if dur > 3600 else ""), note)
+        con.print(t)
+        con.print(f"Total coupé : [bold]{fmt_dur(total)}[/] sur {fmt_dur(times[-1] - t0)}. "
+                  "[dim]Précision = résolution du RRD à cette date (± 2 min sur 24 h, ± 14 min au-delà).[/]")
+    if boot:
+        con.print(f"Dernier démarrage de la box : {fmt_ts(boot, '%d/%m/%Y %H:%M:%S')}")
+    if a.json:
+        print(json.dumps(data))
+
+
+def cmd_report(fbx, a):
+    fbx.login()
+    end, data = fetch_net(fbx, a.hours)
+    events = find_outages(data) if data else []
+    sysc, _ = safe(fbx.get, "system/")
+    conn, _ = safe(fbx.get, "connection/full/")
+    box_logs = sorted((fbx.get("connection/logs/") or []), key=lambda e: e.get("date", 0))
+    start = end - a.hours * 3600
+    local = [r for r in read_events() if r["event"] in ("change", "reboot", "box_push")
+             and datetime.fromisoformat(r["ts"]).timestamp() >= start]
+    L = [f"# Rapport d'incidents Freebox — {datetime.now():%d/%m/%Y %H:%M}", ""]
+    if sysc:
+        mi = sysc.get("model_info") or {}
+        L += [f"- Box : {mi.get('pretty_name', '?')}, firmware {sysc.get('firmware_version')}, "
+              f"n° série {sysc.get('serial')}",
+              f"- Dernier démarrage : {fmt_ts(end - sysc.get('uptime_val', 0), '%d/%m/%Y %H:%M:%S')}"]
+    if conn:
+        L.append(f"- Accès : {conn.get('media')} ({(conn.get('ftth') or {}).get('link_type', '')}), "
+                 f"IPv4 {conn.get('ipv4')}, débit {fmt_bits(conn.get('bandwidth_down'))}")
+    L += ["", f"## Coupures détectées ({a.hours:g} dernières heures, source : statistiques RRD de la box)", ""]
+    if events:
+        L += ["| Début | Fin | Durée | Constat |", "|---|---|---|---|"]
+        total = 0
+        for s_, e, why in events:
+            total += (e or end) - s_
+            L.append(f"| {fmt_ts(s_, '%d/%m/%Y %H:%M')} | {fmt_ts(e, '%d/%m/%Y %H:%M') if e else 'en cours'} | "
+                     f"{fmt_dur((e or end) - s_)} | {' + '.join(sorted(why))} |")
+        L += ["", f"**Durée totale d'indisponibilité : {fmt_dur(total)}**"]
+    else:
+        L.append("Aucune coupure détectée.")
+    L += ["", "## Journal de connexion de la box (depuis son dernier démarrage)", ""]
+    L += [f"- {fmt_ts(e.get('date'), '%d/%m/%Y %H:%M:%S')} — {describe_box_log(e)}" for e in box_logs] or ["(vide)"]
+    if local:
+        L += ["", "## Évènements enregistrés localement (fbx watch / notify)", ""]
+        L += [f"- {r['ts'].replace('T', ' ')} — {describe_event(r).plain}" for r in sorted(local, key=lambda r: r["ts"])]
+    L += ["", "_Précision des horaires : ± 2 min sur 24 h, ± 14 min au-delà (résolution du RRD)._"]
+    out = "\n".join(L) + "\n"
+    if a.output:
+        Path(a.output).write_text(out)
+        con.print(f"[green]Rapport écrit dans {a.output}[/]")
+    else:
+        print(out)
+
+
+# ───────────────────────────── commandes : matériel ─────────────────────────────
+
+SERIES_LABELS = {"temp_cpu0": "CPU 0", "temp_cpu1": "CPU 1", "temp_cpu2": "CPU 2", "temp_cpu3": "CPU 3",
+              "temp_t1": "Carte (t1)", "cpum": "CPU M", "cpub": "CPU B", "sw": "Switch", "hdd": "Disque",
+              "fan0_speed": "Ventilateur", "fan_speed": "Ventilateur",
+              "rate_down": "WAN ↓", "rate_up": "WAN ↑", "vpn_rate_down": "VPN ↓", "vpn_rate_up": "VPN ↑"}
+
+
+def series_table(data, fields, title, fmt, labels=None):
+    labels = {**SERIES_LABELS, **(labels or {})}
+    t = Table(title=title, caption=f"{fmt_ts(data[0]['time'], '%d/%m %H:%M')} → {fmt_ts(data[-1]['time'], '%d/%m %H:%M')}")
+    for c in ("Mesure", "Actuel", "Min", "Moy", "Max"):
+        t.add_column(c, justify="left" if c == "Mesure" else "right", no_wrap=True)
+    width = max(12, con.width - 82)
+    t.add_column("Évolution", no_wrap=True, overflow="crop", min_width=width)
+    for f in fields:
+        vals = [d.get(f) for d in data]
+        v = [x for x in vals if x is not None]
+        if not v:
+            continue
+        cur = next((x for x in reversed(vals) if x is not None), None)
+        t.add_row(labels.get(f, f), fmt(f, cur), fmt(f, min(v)), fmt(f, sum(v) / len(v)), fmt(f, max(v)),
+                  Text(sparkline([(d["time"], d.get(f)) for d in data], width), style="cyan"))
+    return t
+
+
+def cmd_temp(fbx, a):
+    fbx.login()
+    end = int(time.time())
+    data = sorted(fbx.rrd("temp", end - a.hours * 3600, end).get("data") or [], key=lambda d: d["time"])
+    if not data:
+        con.print("[red]Pas de données de température.[/]")
+        return
+    fields = sorted({k for d in data for k in d if k != "time"}, key=lambda k: (k.startswith("fan"), k))
+
+    def fmt(f, v):
+        if v is None:
+            return "—"
+        if f.startswith("fan"):
+            return f"{v:.0f} tr/min"
+        return Text(f"{v:.0f} °C", style="red" if v >= 85 else ("yellow" if v >= 75 else "green"))
+    con.print(series_table(data, fields, f"Températures — {a.hours:g} h", fmt))
+
+
+def cmd_traffic(fbx, a):
+    fbx.login()
+    end, net = fetch_net(fbx, a.hours)
+    sw = sorted(fbx.rrd("switch", end - a.hours * 3600, end).get("data") or [], key=lambda d: d["time"])
+
+    def fmt(f, v):
+        return "—" if v is None else fmt_bits(v * 8)
+    if net:
+        times = [d["time"] for d in net]
+        vol = {k: sum((d.get(k) or 0) * (t2 - t1) for d, t1, t2 in zip(net, times, times[1:])) for k in ("rate_down", "rate_up")}
+        con.print(series_table(net, ["rate_down", "rate_up"], f"Trafic Internet — {a.hours:g} h", fmt))
+        con.print(f"Volume estimé : ↓ {fmt_bytes(vol['rate_down'])}  ↑ {fmt_bytes(vol['rate_up'])}")
+    if sw:
+        names = {}
+        st, _ = safe(fbx.get, "switch/status/")
+        for p in st or []:
+            names[str(p["id"])] = p["name"]
+        ports = sorted({k.split("_", 1)[1] for d in sw for k in d if k != "time"})
+        labels = {}
+        for p in ports:
+            label = names.get(p, "SFP LAN" if p == "sfp_lan" else f"port {p}")
+            labels[f"rx_{p}"], labels[f"tx_{p}"] = f"{label} ↓ reçu", f"{label} ↑ émis"
+        fields = [f"{d}_{p}" for p in ports for d in ("rx", "tx") if any(x.get(f"{d}_{p}") for x in sw)]
+        con.print(series_table(sw, fields, f"Trafic par port du switch — {a.hours:g} h (ports inactifs masqués)",
+                               fmt, labels))
+
+
+def cmd_ports(fbx, a):
+    fbx.login()
+    ports = sorted(fbx.get("switch/status/") or [], key=lambda p: p["id"])
+    t = Table(title="Ports Ethernet de la Freebox")
+    for c in ("Port", "Lien", "Mode", "Débit ↓/↑ actuel", "Erreurs", "Appareils vus"):
+        t.add_column(c)
+    for p in ports:
+        stats, _ = safe(fbx.get, f"switch/port/{p['id']}/stats")
+        stats = {k: v for k, v in (stats or {}).items() if not (isinstance(v, int) and v < 0)}  # -1 = non géré
+        errs = {k: v for k, v in stats.items() if v and any(x in k for x in ("err", "fcs", "collision", "discard",
+                                                                          "jabber", "fragment", "bad", "late"))}
+        names = [(m.get("hostname") or m.get("mac")).split(" (")[0] for m in p.get("mac_list") or []]
+        macs = ", ".join(f"{n} ×{names.count(n)}" if names.count(n) > 1 else n for n in dict.fromkeys(names))
+        t.add_row(p["name"], ok(p.get("link") == "up", "up", "down"), p.get("mode", "?"),
+                  (f"{fmt_bits(stats['rx_bytes_rate'] * 8)} / {fmt_bits(stats['tx_bytes_rate'] * 8)}"
+                   if "rx_bytes_rate" in stats else "non mesuré") if p.get("link") == "up" else "",
+                  Text(", ".join(f"{k}={v}" for k, v in errs.items()) or ("0" if stats else "non mesuré"),
+                       style="red" if errs else ("green" if stats else "dim")),
+                  macs[:60] + ("…" if len(macs) > 60 else ""))
+    con.print(t)
+    sfp, err = safe(fbx.get, "sfp/status")
+    if sfp:
+        con.print(Panel(Text.assemble("Module : ", ok(sfp.get("present"), "présent", "absent"),
+                                      f"  {sfp.get('vendor_name', '')} {sfp.get('part_number', '')}  type "
+                                      f"{sfp.get('used_type') or sfp.get('type', '?')}  lien ", ok(sfp.get("link"), "up", "down"),
+                                      "  alim ", ok(sfp.get("power_good"))), title="Port SFP LAN"))
+
+
+def wifi_rate(r):
+    """Débit PHY d'une station ; l'API le donne en unités de 100 kbit/s."""
+    return fmt_bits((r or {}).get("bitrate", 0) * 100_000)
+
+
+def cmd_wifi(fbx, a):
+    fbx.login()
+    aps = fbx.get("wifi/ap/") or []
+    t = Table(title="Points d'accès Wi-Fi")
+    for c in ("AP", "Bande", "État", "Canal", "Largeur", "Clients"):
+        t.add_column(c)
+    stations = []
+    for ap in aps:
+        st = ap.get("status") or {}
+        cfg = ap.get("config") or {}
+        sta, _ = safe(fbx.get, f"wifi/ap/{ap['id']}/stations/")
+        sta = sta or []
+        stations += [(ap.get("name"), s) for s in sta]
+        state = st.get("state", "?")
+        t.add_row(ap.get("name", str(ap["id"])), cfg.get("band", "?"),
+                  Text(state, style="green" if state == "active" else "yellow"),
+                  str(st.get("primary_channel") or "—"), f"{st.get('channel_width') or cfg.get('channel_width', '?')} MHz",
+                  str(len(sta)))
+    con.print(t)
+    s = Table(title="Clients Wi-Fi")
+    for c in ("Appareil", "AP", "Signal", "Débit ↓/↑ lien", "Connecté depuis", "Inactif"):
+        s.add_column(c)
+    for apname, x in sorted(stations, key=lambda z: z[1].get("signal", -100), reverse=True):
+        sig = x.get("signal")
+        name = (x.get("host") or {}).get("primary_name") or x.get("hostname") or x.get("mac")
+        s.add_row(name.strip(), apname,
+                  Text(f"{sig} dBm", style="green" if sig and sig >= -60 else ("yellow" if sig and sig >= -72 else "red")),
+                  f"{wifi_rate(x.get('last_tx'))} / {wifi_rate(x.get('last_rx'))}", fmt_dur(x.get("conn_duration", 0)),
+                  f"{x.get('inactive', 0)} s")
+    con.print(s)
+
+
+def cmd_lan(fbx, a):
+    fbx.login()
+    hosts = fbx.get("lan/browser/pub/") or []
+    t = Table(title="Appareils LAN")
+    for c in ("Nom", "IP", "MAC", "Type", "Actif", "Vu pour la dernière fois"):
+        t.add_column(c)
+    for h in sorted(hosts, key=lambda h: (not h.get("active"), h.get("primary_name", ""))):
+        if a.active and not h.get("active"):
+            continue
+        ips = [x["addr"] for x in h.get("l3connectivities", []) if x.get("af") == "ipv4" and x.get("active")]
+        t.add_row(h.get("primary_name", "?"), ", ".join(ips) or "—", h.get("l2ident", {}).get("id", "—"),
+                  h.get("host_type", "?"), ok(h.get("active")), fmt_ts(h.get("last_activity"), "%d/%m %H:%M"))
+    con.print(t)
+
+
+# ───────────────────────────── surveillance : WebSocket ─────────────────────────────
+
+WS_EVENTS = ["lan_host_l3addr_reachable", "lan_host_l3addr_unreachable",
+             "vm_state_changed", "storage_partition_state_changed"]
+
+
+def ws_loop(fbx, on_event, stop=None, events=WS_EVENTS):
+    """Écoute ws/event en boucle (reconnexion auto). on_event(source, event, result)."""
+    import websocket  # websocket-client
+    url = fbx.api.replace("http://", "ws://").replace("https://", "wss://") + "ws/event"
+    while not (stop and stop.is_set()):
+        try:
+            if not fbx.session_token:
+                fbx.login()
+            ws = websocket.create_connection(url, header=[f"X-Fbx-App-Auth: {fbx.session_token}"], timeout=30)
+            ws.send(json.dumps({"action": "register", "events": events}))
+            while not (stop and stop.is_set()):
+                try:
+                    msg = json.loads(ws.recv())
+                except websocket.WebSocketTimeoutException:
+                    ws.ping()
+                    continue
+                if msg.get("action") == "notification":
+                    on_event(msg.get("source"), msg.get("event"), msg.get("result") or {})
+                elif msg.get("action") == "register" and not msg.get("success"):
+                    raise FbxError(f"ws register: {msg.get('msg')}")
+        except Exception:  # noqa: BLE001 — box rebootée, session expirée… on retente
+            fbx.session_token = None
+            time.sleep(5)
+
+
+def ws_record(source, event, result):
+    slim = {k: result.get(k) for k in ("id", "primary_name", "name", "host_type", "status", "state", "active")
+            if result.get(k) is not None}
+    l3 = [x.get("addr") for x in result.get("l3connectivities") or [] if x.get("af") == "ipv4"]
+    if l3:
+        slim["ipv4"] = l3
+    return log_event("ws", {"source": source, "event": event, "result": slim})
+
+
+def cmd_events(fbx, a):
+    fbx.login()
+    con.print(f"[dim]Écoute des évènements temps réel ({', '.join(WS_EVENTS)}) — Ctrl+C pour quitter[/]")
+
+    def on_event(source, event, result):
+        rec = ws_record(source, event, result) if not a.no_log else {
+            "ts": datetime.now().isoformat(timespec="seconds"), "event": "ws",
+            "detail": {"source": source, "event": event, "result": result}}
+        con.print(Text.assemble((rec["ts"].replace("T", " ") + "  ", "dim"), describe_event(rec)))
+    try:
+        ws_loop(fbx, on_event)
+    except KeyboardInterrupt:
+        pass
+
+
+# ───────────────────────────── surveillance : push de la box ─────────────────────────────
+
+PUSH_LABELS = {"pub_up": "Connexion Internet rétablie", "reboot": "La box redémarre", "shut_down": "La box s'éteint",
+               "enter_sleep": "La box passe en veille", "first_connection": "Nouvel appareil sur le réseau",
+               "missed_call": "Appel manqué", "task_done": "Téléchargement terminé"}
+
+
+def local_ip_towards(host):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((socket.gethostbyname(host), 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def notif_target_name():
+    return f"fbx-cli@{socket.gethostname()}"
+
+
+def make_notif_handler(notify, allowed_ips):
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _allowed(self):
+            if allowed_ips is None or self.client_address[0] in allowed_ips:
+                return True
+            self.send_response(403)
+            self.end_headers()
+            return False
+
+        def _reply(self, obj):
+            b = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_POST(self):
+            if not self._allowed():
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                body = {}
+            if self.path.rstrip("/").endswith("/send"):
+                payload = body.get("payload") or {}
+                rec = log_event("box_push", {"payload": payload, "title": body.get("title"), "body": body.get("body")})
+                con.print(Text.assemble((rec["ts"].replace("T", " ") + "  ", "dim"), describe_event(rec)))
+                if notify:
+                    ev = payload.get("event", "?")
+                    desktop_notify("Freebox", PUSH_LABELS.get(ev, f"{payload.get('type')}: {ev}"),
+                                   urgent=ev in ("reboot", "shut_down"))
+                self._reply({"failureIds": [], "successIds": body.get("devices") or []})
+            else:  # /register
+                log_event("box_push_register", {"path": self.path, "device_name": body.get("device_name")})
+                self._reply({"success": True})
+
+        def do_DELETE(self):
+            if not self._allowed():
+                return
+            log_event("box_push_unregister", {"path": self.path})
+            self._reply({"success": True})
+    return H
+
+
+def cmd_notify(fbx, a):
+    if a.action == "serve":
+        allowed = None if a.allow_any else {box_host(), "127.0.0.1"}
+        srv = http.server.ThreadingHTTPServer(("0.0.0.0", a.port), make_notif_handler(not a.no_desktop, allowed))
+        con.print(f"[green]Réception des notifications de la box sur le port {a.port}[/] "
+                  f"({'toutes sources' if allowed is None else 'source autorisée : ' + ', '.join(sorted(allowed))}) "
+                  "— Ctrl+C pour quitter")
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        return
+    fbx.login()
+    targets = fbx.get("notif/targets") or []
+    if a.action == "list":
+        t = Table(title="Cibles de notification enregistrées sur la box")
+        for c in ("Nom", "Type", "Abonnements", "Serveur", "Dernier envoi"):
+            t.add_column(c)
+        for x in targets:
+            t.add_row(x.get("name", "?"), x.get("type", "?"), ", ".join(x.get("subscriptions") or []),
+                      x.get("api_url", "?"), fmt_ts(x.get("last_use"), "%d/%m %H:%M") if x.get("last_use") else "—")
+        con.print(t)
+        return
+    mine = [x for x in targets if x.get("name") == notif_target_name()]
+    try:
+        if a.action == "unregister":
+            for x in mine:
+                fbx.delete(f"notif/targets/{x['id']}")
+            con.print(f"[green]{len(mine)} cible(s) supprimée(s).[/]")
+            return
+        url = a.target_url or f"http://{local_ip_towards(box_host())}:{a.port}"
+        for x in mine:  # ré-enregistrement propre
+            fbx.delete(f"notif/targets/{x['id']}")
+        fbx.post("notif/targets/", {"name": notif_target_name(), "type": "firebase", "token": APP_ID,
+                                    "subscriptions": ["box_state", "lan_host", "password_change"],
+                                    "api_url": url, "message_type": "data"})
+        con.print(f"[green]✓ La box enverra ses notifications (reboot, extinction, Internet rétabli, nouvel appareil, "
+                  f"changement de mot de passe) à {url}[/]\n[dim]Garde `fbx notify serve` actif (ou `fbx service install`).[/]")
+    except FbxError as e:
+        if e.missing_right == "settings" or e.code == "insufficient_rights":
+            con.print("[bold red]Droit manquant : « Modification des réglages ».[/]\n"
+                      "Accorde-le dans Freebox OS → Paramètres de la Freebox → Gestion des accès → onglet Applications "
+                      "→ « fbx CLI » → cocher « Modification des réglages », puis relance la commande.")
+            return 1
+        raise
+
+
+# ───────────────────────────── surveillance : watch ─────────────────────────────
+
+def key_state(snap):
+    sysc, conn, ftth = snap.get("system") or {}, snap.get("conn") or {}, snap.get("ftth") or {}
+    up = snap.get("upnp") or {}
+    return {
+        "box_joignable": snap.get("system") is not None or bool(up.get("ConnectionStatus")),
+        "etape6_auth": sysc.get("box_authenticated"),
+        "wan": conn.get("state") or ({"Connected": "up"}.get(up.get("ConnectionStatus"), up.get("ConnectionStatus"))),
+        "ipv4": conn.get("ipv4") or up.get("ExternalIPAddress"),
+        "signal_optique": ftth.get("sfp_has_signal"),
+        "lien_pon": ftth.get("link"),
+        "etape": boot_phase(snap)[0] if (snap.get("system") or snap.get("conn")) else None,
+        "uptime_val": sysc.get("uptime_val"),
+    }
+
+
+ALERT_FIELDS = {"box_joignable", "etape", "etape6_auth", "wan", "signal_optique", "lien_pon", "internet_pc"}
+
+
+def cmd_watch(fbx, a):
+    stop = threading.Event()
+    try:
+        fbx.login()
+    except Exception as e:  # noqa: BLE001
+        con.print(f"[yellow]API indisponible ({e}) — surveillance via UPnP et tests réseau uniquement.[/]")
+    log_event("watch_start", {"interval": a.interval, "headless": a.headless})
+
+    def out(rec):
+        if a.headless:
+            con.print(Text.assemble((rec["ts"].replace("T", " ") + "  ", "dim"), describe_event(rec)))
+
+    if not a.no_ws:
+        def on_ws(source, event, result):
+            if a.no_lan and source == "lan":
+                return
+            out(ws_record(source, event, result))
+        def ws_thread():
+            while not stop.is_set():
+                try:
+                    ws_fbx = Freebox(fbx.base)
+                    break
+                except requests.RequestException:
+                    time.sleep(10)
+            ws_loop(ws_fbx, on_ws, stop)
+        threading.Thread(target=ws_thread, daemon=True).start()
+
+    prev = None
+
+    def tick():
+        nonlocal prev
+        if not fbx.session_token:
+            safe(fbx.login)
+        try:
+            snap = snapshot(fbx) if fbx.session_token else {"system_err": "API non authentifiée"}
+        except Exception as e:  # noqa: BLE001
+            snap = {"system_err": str(e)}
+        snap["upnp"] = upnp_status(box_host())
+        net = internet_check()
+        if fbx.session_token:
+            for e in safe(sync_box_logs, fbx)[0] or []:
+                out({"ts": datetime.fromtimestamp(e["date"]).isoformat(timespec="seconds"), "event": "box_log", "detail": e})
+        cur = key_state(snap)
+        cur["internet_pc"] = any(isinstance(v, int) and not isinstance(v, bool) for v in net.values())
+        if prev is None:
+            out(log_event("initial", {k: v for k, v in cur.items() if k != "uptime_val"}))
+        else:
+            if cur["uptime_val"] is not None and prev["uptime_val"] is not None and cur["uptime_val"] < prev["uptime_val"]:
+                out(log_event("reboot", {"uptime_val": cur["uptime_val"]}))
+                if a.notify:
+                    desktop_notify("Freebox", "La box a redémarré", urgent=True)
+            for k in cur:
+                if k != "uptime_val" and cur[k] != prev[k]:
+                    out(log_event("change", {"champ": k, "avant": prev[k], "apres": cur[k]}))
+                    if a.notify and k in ALERT_FIELDS:
+                        bad = cur[k] in (False, "down", "going_down", None)
+                        desktop_notify("Freebox", f"{k} : {prev[k]} → {cur[k]}", urgent=bad)
+        prev = cur
+        return snap, net
+
+    try:
+        if a.headless:
+            while True:
+                tick()
+                time.sleep(a.interval)
+        with Live(console=con, refresh_per_second=2, screen=not a.no_screen) as live:
+            while True:
+                snap, net = tick()
+                recent = [r for r in read_events() if r["event"] in ("change", "reboot", "ws", "box_push", "box_log")][-6:]
+                live.update(render_status(snap, net, recent))
+                time.sleep(a.interval)
+    except KeyboardInterrupt:
+        stop.set()
+
+
+def cmd_log(fbx, a):
+    evs = read_events()
+    if not evs:
+        con.print(f"[dim]Aucun journal ({EVENT_LOG}). Lance `fbx watch` pour en créer un.[/]")
+        return
+    if a.box:
+        evs = [r for r in evs if r["event"] == "box_log"]
+    if a.kind:
+        evs = [r for r in evs if r["event"] == a.kind]
+    elif not a.all:  # les apparitions/disparitions d'appareils LAN noient le reste
+        evs = [r for r in evs if not (r["event"] == "ws" and r["detail"].get("source") == "lan")]
+    evs.sort(key=lambda r: r["ts"])
+    t = Table(title=str(EVENT_LOG))
+    t.add_column("Date")
+    t.add_column("Source")
+    t.add_column("Détail")
+    for r in evs[-a.n:]:
+        t.add_row(r["ts"].replace("T", " "), r["event"], describe_event(r))
+    con.print(t)
+
+
+SERVICES = {
+    "fbx-watch": ("Surveillance Freebox (fbx watch)", "watch --headless --notify --no-lan"),
+    "fbx-notify": ("Réception des notifications push de la Freebox", "notify serve"),
+}
+
+
+SYSTEM_UNIT_DIRS = (Path("/usr/lib/systemd/user"), Path("/etc/systemd/user"))
+
+
+def cmd_service(fbx, a):
+    unit_dir = Path.home() / ".config/systemd/user"
+    exe = Path(sys.argv[0]).resolve()
+    packaged = all(any((d / f"{n}.service").exists() for d in SYSTEM_UNIT_DIRS) for n in SERVICES)
+    if a.action == "install":
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        for name, (desc, args) in ({} if packaged else SERVICES).items():
+            (unit_dir / f"{name}.service").write_text(
+                f"[Unit]\nDescription={desc}\nAfter=network-online.target\nWants=network-online.target\n\n"
+                f"[Service]\nExecStart={sys.executable} {exe} {args}\nRestart=always\nRestartSec=10\n"
+                f"Environment=PYTHONUNBUFFERED=1\n\n[Install]\nWantedBy=default.target\n")
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        subprocess.run(["systemctl", "--user", "enable", "--now", *[f"{n}.service" for n in SERVICES]], check=False)
+        con.print("[green]Services installés et démarrés :[/] " + ", ".join(SERVICES) +
+                  "\n[dim]Pour qu'ils tournent sans session ouverte : `loginctl enable-linger $USER`.\n"
+                  "Puis `fbx notify register` pour que la box envoie ses notifications à fbx-notify.[/]")
+    elif a.action == "uninstall":
+        subprocess.run(["systemctl", "--user", "disable", "--now", *[f"{n}.service" for n in SERVICES]], check=False)
+        for name in SERVICES:
+            if not packaged:
+                (unit_dir / f"{name}.service").unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        con.print("[green]Services supprimés.[/]")
+    else:
+        subprocess.run(["systemctl", "--user", "--no-pager", "status", *[f"{n}.service" for n in SERVICES]], check=False)
+
+
+# ───────────────────────────── main ─────────────────────────────
+
+def _on_sigterm(*_):
+    """systemd arrête les services par SIGTERM : on le traite comme Ctrl+C pour sortir proprement."""
+    raise KeyboardInterrupt
+
+def main():
+    p = argparse.ArgumentParser(prog="fbx", description="Surveillance Freebox OS en ligne de commande",
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n\n", 2)[2])
+    p.add_argument("--url", default=BASE, help=f"URL de la box (défaut {BASE})")
+    p.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
+    sp = p.add_subparsers(dest="cmd", required=True)
+    sp.add_parser("auth", help="Autoriser l'appli (validation sur l'écran de la box)")
+    sp.add_parser("status", help="État complet + diagnostic")
+    lg = sp.add_parser("logs", help="Journal de connexion interne de la box")
+    lg.add_argument("--save", action="store_true", help="Archiver les entrées dans le journal local")
+    sp.add_parser("upnp", help="État WAN via UPnP (sans authentification)")
+    h = sp.add_parser("history", help="Historique RRD et coupures détectées")
+    h.add_argument("-H", "--hours", type=float, default=24)
+    h.add_argument("--json", action="store_true", help="Dump brut des points")
+    r = sp.add_parser("report", help="Rapport Markdown des coupures")
+    r.add_argument("-H", "--hours", type=float, default=48)
+    r.add_argument("-o", "--output", help="Fichier de sortie (sinon stdout)")
+    t = sp.add_parser("temp", help="Températures et ventilateur")
+    t.add_argument("-H", "--hours", type=float, default=24)
+    tr = sp.add_parser("traffic", help="Débits WAN et par port")
+    tr.add_argument("-H", "--hours", type=float, default=24)
+    sp.add_parser("ports", help="Ports Ethernet/SFP : lien, erreurs, appareils")
+    sp.add_parser("wifi", help="Points d'accès et clients Wi-Fi")
+    ln = sp.add_parser("lan", help="Appareils du réseau local")
+    ln.add_argument("-a", "--active", action="store_true", help="Seulement les appareils actifs")
+    w = sp.add_parser("watch", help="Surveillance live + journal des changements")
+    w.add_argument("-i", "--interval", type=float, default=10)
+    w.add_argument("--headless", action="store_true", help="Sans tableau de bord (pour un service)")
+    w.add_argument("--notify", action="store_true", help="Notifications bureau (notify-send) sur changement")
+    w.add_argument("--no-ws", action="store_true", help="Ne pas écouter le WebSocket d'évènements")
+    w.add_argument("--no-lan", action="store_true", help="Ignorer les évènements d'appareils LAN")
+    w.add_argument("--no-screen", action="store_true", help="Ne pas utiliser l'écran alterné")
+    e = sp.add_parser("events", help="Flux temps réel des évènements de la box")
+    e.add_argument("--no-log", action="store_true", help="Ne pas écrire dans le journal local")
+    n = sp.add_parser("notify", help="Notifications push émises par la box")
+    n.add_argument("action", choices=["serve", "register", "unregister", "list"])
+    n.add_argument("--port", type=int, default=NOTIF_PORT)
+    n.add_argument("--target-url", help="URL du récepteur à déclarer (défaut : http://<IP de ce PC>:<port>)")
+    n.add_argument("--no-desktop", action="store_true", help="serve : pas de notification bureau")
+    n.add_argument("--allow-any", action="store_true", help="serve : accepter des requêtes d'autres IP que la box")
+    sv = sp.add_parser("service", help="Services systemd utilisateur (watch + notify)")
+    sv.add_argument("action", choices=["install", "uninstall", "status"])
+    l2 = sp.add_parser("log", help="Afficher le journal local")
+    l2.add_argument("-n", type=int, default=50)
+    l2.add_argument("--box", action="store_true", help="Seulement le journal de connexion archivé de la box")
+    l2.add_argument("--kind", help="Filtrer par type (change, box_log, box_push, ws, reboot…)")
+    l2.add_argument("--all", action="store_true", help="Inclure les évènements d'appareils LAN")
+    g = sp.add_parser("get", help="GET brut sur un endpoint")
+    g.add_argument("path")
+    a = p.parse_args()
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+    no_api = {"log": cmd_log, "upnp": cmd_upnp, "service": cmd_service}
+    if a.cmd in no_api:
+        return no_api[a.cmd](None, a)
+    if a.cmd == "notify" and a.action == "serve":
+        return cmd_notify(None, a)
+    try:
+        fbx = Freebox(a.url)
+    except requests.RequestException as e:
+        con.print(f"[bold red]API Freebox injoignable sur {a.url}[/] : {e}")
+        if a.cmd == "watch":
+            log_event("change", {"champ": "box_joignable", "avant": None, "apres": False})
+        return 2
+    cmds = {"auth": cmd_auth, "status": cmd_status, "logs": cmd_logs, "history": cmd_history, "report": cmd_report,
+            "temp": cmd_temp, "traffic": cmd_traffic, "ports": cmd_ports, "wifi": cmd_wifi, "lan": cmd_lan,
+            "watch": cmd_watch, "events": cmd_events, "notify": cmd_notify, "get": cmd_get}
+    try:
+        return cmds[a.cmd](fbx, a)
+    except FbxError as e:
+        con.print(f"[bold red]Erreur :[/] {e}")
+        return 1
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

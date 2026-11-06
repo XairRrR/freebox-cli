@@ -1,0 +1,14 @@
+[Unit]
+Description=Surveillance Freebox (fbx watch)
+Documentation=https://github.com/XairRrR/freebox-cli
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/fbx watch --headless --notify --no-lan
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

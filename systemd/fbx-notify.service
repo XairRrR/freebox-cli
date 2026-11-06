@@ -1,0 +1,14 @@
+[Unit]
+Description=Réception des notifications push de la Freebox (fbx notify serve)
+Documentation=https://github.com/XairRrR/freebox-cli
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/fbx notify serve
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

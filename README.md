@@ -1,31 +1,30 @@
+**English** | [Français](README.fr.md)
+
 # freebox-cli (`fbx`)
 
-Surveillance et diagnostic d'une **Freebox** en ligne de commande : état de la
-connexion, **étape de démarrage bloquante** (étape 2, 3, 6…), historique des
-coupures, journal de connexion de la box, températures, ports, Wi-Fi, et
-notifications push émises par la box elle-même.
+Command-line monitoring and diagnostics for a **Freebox** (the router of the
+French ISP Free): connection state, **failing boot step** (step 2, 3, 6…),
+outage history, the box's internal connection log, temperatures, ports, Wi-Fi,
+and push notifications sent by the box itself.
 
-> **Outil non officiel**, sans lien avec Free ni Iliad. « Freebox » est une
-> marque de Free SAS, citée uniquement pour décrire la compatibilité.
+> **Unofficial tool**, not affiliated with Free or Iliad. "Freebox" is a
+> trademark of Free SAS, used only to describe compatibility.
 
-*English summary: unofficial CLI to monitor a Freebox (French ISP Free): connection
-state, failing boot step, outage history from the box's RRD stats, internal
-connection log, temperatures, switch ports, Wi-Fi clients and push
-notifications. Output is in French.*
+The program's output is in French.
 
-Testé sur Freebox Ultra (API v16). Les autres modèles exposant l'API Freebox OS
-(v8+) devraient fonctionner, sans garantie.
+Tested on Freebox Ultra (API v16). Other models exposing the Freebox OS API
+(v8+) should work, without guarantee.
 
 ## Installation
 
-Prérequis : Python ≥ 3.10 avec `requests`, `rich` et `websocket-client`.
-`libnotify` (`notify-send`) est optionnel, pour les notifications bureau.
+Requirements: Python ≥ 3.10 with `requests`, `rich` and `websocket-client`.
+`libnotify` (`notify-send`) is optional, for desktop notifications.
 
 ### Arch Linux
 
-Le paquet AUR `freebox-cli` est prêt mais **pas encore publié** : les
-inscriptions sur l'AUR sont temporairement fermées. En attendant, installation
-manuelle :
+The `freebox-cli` AUR package is ready but **not published yet**: new account
+registration on the AUR is temporarily closed. In the meantime, install
+manually:
 
 ```sh
 sudo pacman -S --needed python-requests python-rich python-websocket-client
@@ -35,13 +34,13 @@ sudo install -Dm755 fbx /usr/bin/fbx
 sudo install -Dm644 systemd/fbx-watch.service systemd/fbx-notify.service -t /usr/lib/systemd/user/
 ```
 
-Désinstallation :
+Uninstall:
 
 ```sh
 sudo rm /usr/bin/fbx /usr/lib/systemd/user/fbx-watch.service /usr/lib/systemd/user/fbx-notify.service
 ```
 
-### Autres distributions
+### Other distributions
 
 ```sh
 # Debian / Ubuntu
@@ -53,85 +52,86 @@ git clone https://github.com/XairRrR/freebox-cli.git
 install -Dm755 freebox-cli/fbx ~/.local/bin/fbx
 ```
 
-Sans installation des fichiers `systemd/`, `fbx service install` crée lui-même
-les services dans `~/.config/systemd/user/`.
+If the `systemd/` files are not installed, `fbx service install` creates the
+services itself in `~/.config/systemd/user/`.
 
-## Premier lancement
+## First run
 
 ```sh
 fbx auth
 ```
 
-Une demande d'autorisation s'affiche sur l'écran de la Freebox : il faut la
-valider **sur la box**. Le jeton est enregistré dans
-`~/.config/fbx/token.json` (droits 600).
+An authorization request appears on the Freebox front screen: you must accept
+it **on the box itself**. The token is stored in `~/.config/fbx/token.json`
+(mode 600).
 
-Par défaut l'application n'a pas le droit « Modification des réglages ». Il
-n'est nécessaire que pour `fbx notify register` : à accorder dans Freebox OS →
-Paramètres de la Freebox → Gestion des accès → Applications → « fbx CLI ».
+By default the app does not get the "Modification des réglages" (settings)
+permission. It is only needed for `fbx notify register`: grant it in Freebox OS
+→ Paramètres de la Freebox → Gestion des accès → Applications → "fbx CLI".
 
-## Commandes
+## Commands
 
-| Commande | Rôle |
+| Command | Purpose |
 |---|---|
-| `fbx status` | État complet : système, étape de démarrage, WAN, fibre (puissance optique), diagnostic |
-| `fbx logs [--save]` | Journal de connexion interne de la box (effacé à chaque redémarrage de la box) |
-| `fbx upnp` | État WAN via UPnP IGD, **sans authentification** |
-| `fbx history [-H 24]` | Coupures détectées dans l'historique de débit de la box |
-| `fbx report [-H 48] [-o fichier.md]` | Rapport Markdown des coupures (utile pour une réclamation) |
-| `fbx temp [-H 24]` | Températures CPU et ventilateur |
-| `fbx traffic [-H 24]` | Débits Internet et par port du switch, volume transféré |
-| `fbx ports` | Ports Ethernet / SFP : lien, vitesse, erreurs, appareils vus |
-| `fbx wifi` | Points d'accès et clients Wi-Fi (signal, débit PHY) |
-| `fbx lan [-a]` | Appareils connus du réseau local |
-| `fbx watch [--headless] [--notify]` | Tableau de bord temps réel + journal local des changements |
-| `fbx events` | Évènements temps réel (WebSocket) : appareils LAN, VM, stockage |
-| `fbx notify serve\|register\|unregister\|list` | Notifications push émises par la box |
-| `fbx service install\|uninstall\|status` | Services systemd utilisateur (`fbx-watch`, `fbx-notify`) |
-| `fbx log [-n 50] [--box] [--kind K]` | Journal local (`~/.local/state/fbx/events.jsonl`) |
-| `fbx get <chemin>` | Appel brut à l'API (ex. `fbx get connection/ftth/`) |
+| `fbx status` | Full state: system, boot step, WAN, fiber (optical power), diagnosis |
+| `fbx logs [--save]` | The box's internal connection log (cleared every time the box reboots) |
+| `fbx upnp` | WAN state over UPnP IGD, **no authentication required** |
+| `fbx history [-H 24]` | Outages detected in the box's bandwidth history |
+| `fbx report [-H 48] [-o file.md]` | Markdown outage report (useful for a complaint to the ISP) |
+| `fbx temp [-H 24]` | CPU temperatures and fan speed |
+| `fbx traffic [-H 24]` | Internet and per-switch-port throughput, transferred volume |
+| `fbx ports` | Ethernet / SFP ports: link, speed, errors, devices seen |
+| `fbx wifi` | Wi-Fi access points and clients (signal, PHY rate) |
+| `fbx lan [-a]` | Devices known on the local network |
+| `fbx watch [--headless] [--notify]` | Live dashboard + local log of state changes |
+| `fbx events` | Real-time events (WebSocket): LAN devices, VMs, storage |
+| `fbx notify serve\|register\|unregister\|list` | Push notifications sent by the box |
+| `fbx service install\|uninstall\|status` | systemd user services (`fbx-watch`, `fbx-notify`) |
+| `fbx log [-n 50] [--box] [--kind K]` | Local log (`~/.local/state/fbx/events.jsonl`) |
+| `fbx get <path>` | Raw API call (e.g. `fbx get connection/ftth/`) |
 
-### Étape de démarrage
+### Boot step
 
-`fbx status` et `fbx watch` déduisent l'étape où la box est bloquée, d'après
-[les étapes officielles](https://assistance.free.fr/articles/311) :
+`fbx status` and `fbx watch` infer the step at which the box is stuck, based on
+[Free's official boot steps](https://assistance.free.fr/articles/311) (French):
 
-| Étape | Situation | Responsable probable |
+| Step | Situation | Likely cause |
 |---|---|---|
-| 2 | Aucune lumière reçue | Fibre, point de mutualisation, NRO |
-| 3 | Lumière reçue, enregistrement PON impossible | Équipement fibre Free (OLT) |
-| 6 | Lien OK, authentification de la box refusée | Serveurs d'authentification Free |
-| 7 | Authentifiée, WAN pas encore monté | Configuration WAN |
-| 8 | Opérationnelle | — |
+| 2 | No light received | Fiber, street cabinet (PM), central office (NRO) |
+| 3 | Light received, PON registration failing | Free's fiber equipment (OLT) |
+| 6 | Link OK, box authentication refused | Free's authentication servers |
+| 7 | Authenticated, WAN not up yet | WAN configuration |
+| 8 | Operational | — |
 
-L'API locale reste joignable pendant une coupure Internet : `fbx watch` enregistre
-l'heure exacte de chaque changement d'étape.
+The local API stays reachable during an Internet outage: `fbx watch` records
+the exact time of every step change.
 
-### Surveillance permanente
+### Continuous monitoring
 
 ```sh
-fbx service install           # active fbx-watch et fbx-notify (systemd --user)
-loginctl enable-linger $USER  # pour qu'ils tournent sans session ouverte
-fbx notify register           # la box envoie ses notifications à fbx-notify
+fbx service install           # enables fbx-watch and fbx-notify (systemd --user)
+loginctl enable-linger $USER  # keeps them running without an open session
+fbx notify register           # the box sends its notifications to fbx-notify
 ```
 
-`fbx notify serve` écoute sur le port 47800 (`FBX_NOTIF_PORT`) et n'accepte que
-les requêtes venant de la box (option `--allow-any` pour désactiver ce filtre).
+`fbx notify serve` listens on port 47800 (`FBX_NOTIF_PORT`) and only accepts
+requests coming from the box (use `--allow-any` to disable this filter).
 
 ## Configuration
 
-| Variable | Défaut | Rôle |
+| Variable | Default | Purpose |
 |---|---|---|
-| `FBX_URL` | `http://mafreebox.freebox.fr` | Adresse de l'API |
-| `FBX_UPNP_PORT` | `5678` | Port UPnP de repli (découverte SSDP sinon) |
-| `FBX_NOTIF_PORT` | `47800` | Port du récepteur de notifications |
+| `FBX_URL` | `http://mafreebox.freebox.fr` | API address |
+| `FBX_UPNP_PORT` | `5678` | Fallback UPnP port (SSDP discovery otherwise) |
+| `FBX_NOTIF_PORT` | `47800` | Notification receiver port |
 
-## Endpoints utilisés
+## Endpoints used
 
-En plus de l'[API documentée](http://mafreebox.freebox.fr/doc/index.html),
-`fbx` utilise des endpoints non documentés de l'interface Freebox OS
-(`connection/logs/`, `connection/full/`, `update/`) : ils peuvent changer sans
-préavis lors d'une mise à jour de la box.
+In addition to the [documented API](http://mafreebox.freebox.fr/doc/index.html)
+(reachable from the box's local network only), `fbx` uses undocumented
+endpoints of the Freebox OS web interface (`connection/logs/`,
+`connection/full/`, `update/`): they may change without notice after a box
+firmware update.
 
 ## Tests
 
@@ -139,11 +139,11 @@ préavis lors d'une mise à jour de la box.
 python -m pytest tests
 ```
 
-## Licence
+## License
 
 Copyright (C) 2026 Philippe Pignatel
 
-Ce programme est un logiciel libre distribué sous la **GNU General Public
-License version 2 uniquement** (GPL-2.0-only) — voir [LICENSE](LICENSE).
-Toute version modifiée et redistribuée doit l'être sous la même licence, avec
-son code source.
+This program is free software distributed under the **GNU General Public
+License version 2 only** (GPL-2.0-only) — see [LICENSE](LICENSE). Any modified
+version that is redistributed must be released under the same license, with
+its source code.

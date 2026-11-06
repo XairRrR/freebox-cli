@@ -18,14 +18,43 @@ Testé sur Freebox Ultra (API v16). Les autres modèles exposant l'API Freebox O
 
 ## Installation
 
-Arch Linux (AUR) :
+Prérequis : Python ≥ 3.10 avec `requests`, `rich` et `websocket-client`.
+`libnotify` (`notify-send`) est optionnel, pour les notifications bureau.
+
+### Arch Linux
+
+Le paquet AUR `freebox-cli` est prêt mais **pas encore publié** : les
+inscriptions sur l'AUR sont temporairement fermées. En attendant, installation
+manuelle :
 
 ```sh
-yay -S freebox-cli        # ou paru, ou makepkg -si
+sudo pacman -S --needed python-requests python-rich python-websocket-client
+git clone https://github.com/XairRrR/freebox-cli.git
+cd freebox-cli
+sudo install -Dm755 fbx /usr/bin/fbx
+sudo install -Dm644 systemd/fbx-watch.service systemd/fbx-notify.service -t /usr/lib/systemd/user/
 ```
 
-Ailleurs : Python ≥ 3.10 avec `requests`, `rich` et `websocket-client`, puis
-copier `fbx` dans le `PATH`.
+Désinstallation :
+
+```sh
+sudo rm /usr/bin/fbx /usr/lib/systemd/user/fbx-watch.service /usr/lib/systemd/user/fbx-notify.service
+```
+
+### Autres distributions
+
+```sh
+# Debian / Ubuntu
+sudo apt install python3-requests python3-rich python3-websocket
+# Fedora
+sudo dnf install python3-requests python3-rich python3-websocket-client
+
+git clone https://github.com/XairRrR/freebox-cli.git
+install -Dm755 freebox-cli/fbx ~/.local/bin/fbx
+```
+
+Sans installation des fichiers `systemd/`, `fbx service install` crée lui-même
+les services dans `~/.config/systemd/user/`.
 
 ## Premier lancement
 
